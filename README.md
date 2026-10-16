@@ -65,6 +65,7 @@ Override any of these in your profile's `cordis.patch.yml`:
 | `promptOrder` | `150` | Where the section lands in the assembled prompt. |
 | `defaultLimit` / `maxLimit` | `50` / `500` | Query result sizes. |
 | `maxEntities` / `maxFacts` | `20000` / `100000` | Capacity guards; a write past the bound fails loudly. |
+| `enableIngest` | `true` | Whether to register the database ingestion tools. |
 
 Running two isolated graphs is just two rows:
 
@@ -157,6 +158,75 @@ connected in 3 step(s):
 | `path` | How are these two entities connected? |
 | `dump` | Everything asserted — terms, entities, facts — as data, for export or backup. Re-import is `ontology_define` + `ontology_assert`. |
 
+## Importing from a relational database
+
+An ontology is only useful once there is something in it, and the something is usually already sitting in a database. `ontology_ingest_db` reads a MySQL or PostgreSQL schema and loads it as entities and facts, with **foreign keys becoming the relations**. Declare the vocabulary first — the import validates against it like any other write.
+
+The mapping says which table is which class, and what each column means:
+
+```yaml
+# ontology-ingest.yml — the whole example is in examples/
+connection:
+  type: postgres
+  host: localhost
+  database: business
+  user: readonly
+  password: ${DB_PASSWORD}          # read from the environment, never inlined
+
+mapping:
+  tables:
+    - table: users
+      entityClass: Person            # users.id=1 → entity `users_1`
+      idColumn: id
+      labelColumn: full_name         # the label an entity search will match
+      attributes:
+        - column: email
+          relation: has_email
+          transform: lowercase
+      foreignKeys:
+        - column: team_id            # users.team_id → teams.id
+          targetTable: teams
+          relation: member_of        # so: users_1 member_of teams_1
+        - column: manager_id         # a self-reference is fine
+          targetTable: users
+          relation: reports_to
+
+    - table: teams
+      entityClass: Team
+      idColumn: id
+      labelColumn: name
+      where: "deleted_at IS NULL"    # soft-deleted rows never reach the graph
+```
+
+Rules of the mapping:
+
+| Database | becomes | Notes |
+|---|---|---|
+| table | a class you declare | `entityClass` must already exist, or the import refuses before reading a row |
+| row | an entity | id is `<table>_<pk>`, or `<prefix>_<table>_<pk>` with `globalPrefix` |
+| `labelColumn` | the entity's label | what `ontology_query { mode: "entities", search: "张三" }` matches on |
+| foreign key | an entity-valued relation | both sides must already exist as classes |
+| other column | a literal-valued relation | needs `rangeKind: "literal"`; NULL values are skipped, not stored as empty strings |
+| `where` | a SQL filter | applied per table, for soft deletes and partitions |
+
+Two properties make the round trip worth it:
+
+- **Idempotent.** Re-running an import rewrites the same keys, so a nightly full sync is harmless.
+- **Inferable.** The database stores `orders.user_id`; it never stores `users_1 placed orders_1001`. Declare `placed_by` with `inverseOf: placed` and the query engine derives the reverse. A self-referencing foreign key declared `transitive` becomes a whole reporting chain from one hop of stored data.
+
+So the question *"张三的订单是什么，供应商是谁"* is answered by resolving the label to a person, asking for their entailed `placed` edges, and reading `supplied_by` off each order — no hand-written SQL, and the answer comes back as facts carrying `via` so you can see which parts were stored and which were derived.
+
+Ingest runs in three modes: `full`, `incremental` (with a `timestampColumn` and `lastSyncTime`), and `dry-run`, which reports what *would* be written, with sample entities and facts, and touches nothing.
+
+PostgreSQL and MySQL drivers (`pg`, `mysql2`) are optional peer dependencies — install only the one you use:
+
+```sh
+pnpm add pg        # PostgreSQL
+pnpm add mysql2    # MySQL
+```
+
+Rows are read in batches (`batchSize`, default 500) and every write goes through the same validators the tools use, so a `strict` ontology refuses a mapping that would violate it — naming the constraint — rather than importing a broken graph.
+
 ## The rules it enforces
 
 **Subsumption.** `subClassOf` is transitive: an entity declared `Service` is also a `Component`, so it satisfies a `Component` domain and is returned by a `Component` query. Cycles are refused at definition time — a cycle would make "is an X" unfalsifiable for every class on it.
@@ -217,7 +287,7 @@ import { entail, findPath, validateFactInput } from 'dsh-ontology/ontology'
 
 ```sh
 pnpm install
-pnpm test        # 60 unit tests: rules, tools, prompt section
+pnpm test        # 124 unit tests: rules, tools, prompt section, ingestion
 pnpm typecheck
 pnpm build
 pnpm smoke       # boot smoke against a real dsh profile (see below)
@@ -225,6 +295,8 @@ pnpm bench 2000 3
 ```
 
 `tests/memory-domain.ts` is an in-memory stand-in for one open storage domain, so the store and the tools are tested end to end — real validation, real entailment, real tool results — without a backend.
+
+`tests/ingest/e2e.spec.ts` is the ingest suite that a mock cannot cover: it runs against real PostgreSQL and MySQL servers, and skips itself when they are absent so a plain `pnpm test` stays hermetic and fast. To run it, `scripts/e2e-databases.sh up` starts both on non-default ports (55432, 33306) and loads `tests/ingest/fixtures/`; `down` removes them. The fixtures carry Chinese labels on purpose — MySQL's client falls back to latin1 without a `--default-character-set`, which is exactly the encoding bug the suite caught in the connector.
 
 `pnpm smoke` is the test the unit suite cannot be. It installs the packed tarball into a fresh dsh profile created from the shipped `headless` template (so `dsh-base` is present), boots it against a scripted local LLM that speaks both wire formats the harness has used, drives `ontology_define` → `ontology_assert` → `ontology_query` with inference, then boots a second time over the same `$DSH_HOME` to check persistence and that the prompt section now carries the vocabulary. No network beyond the npm registry, no API key. `DSH_VERSION` picks the harness (CI runs the oldest supported line and `next`); `DSH_BIN` reuses an installed one; `SMOKE_PLUGIN_SPEC=dsh-ontology@0.1.0` demonstrates that the test catches the duplicate-storage-row boot crash of that release.
 
