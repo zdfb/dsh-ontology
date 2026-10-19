@@ -5,12 +5,7 @@
 
 import type { Client, ClientConfig } from 'pg'
 import type { DbConnector } from './base.ts'
-import type {
-  ColumnInfo,
-  ConnectionConfig,
-  ForeignKeyInfo,
-  TableMetadata,
-} from '../types.ts'
+import type { ColumnInfo, ConnectionConfig } from '../types.ts'
 
 /** What a driver module is loaded through. */
 type PgModule = typeof import('pg')
@@ -38,7 +33,7 @@ async function loadDriver(): Promise<PgModule> {
 }
 
 export class PostgresConnector implements DbConnector {
-  private client: Client | null = null
+  #client: Client | null = null
 
   constructor(private config: ConnectionConfig) {
     if (config.type !== 'postgres') {
@@ -66,116 +61,58 @@ export class PostgresConnector implements DbConnector {
       connectionTimeoutMillis: this.config.connectionTimeout ?? 10000,
     }
 
-    this.client = new PgClient(options)
-    await this.client.connect()
+    this.#client = new PgClient(options)
+    await this.#client.connect()
   }
 
   async close(): Promise<void> {
-    if (this.client) {
-      await this.client.end()
-      this.client = null
-    }
+    const client = this.#client
+    this.#client = null
+    if (client !== null) await client.end()
   }
 
-  async query<T = any>(sql: string, params?: any[]): Promise<T[]> {
-    if (!this.client) throw new Error('Not connected')
-    const result = await this.client.query(sql, params)
+  async #query<T>(sql: string, params?: unknown[]): Promise<T[]> {
+    const client = this.#client
+    if (client === null) throw new Error('not connected')
+    const result = await client.query(sql, params as never)
     return result.rows as T[]
   }
 
   async getTables(): Promise<string[]> {
-    const rows = await this.query<{ table_name: string }>(`
+    const rows = await this.#query<{ table_name: string }>(`
       SELECT table_name
       FROM information_schema.tables
       WHERE table_schema = 'public'
         AND table_type = 'BASE TABLE'
       ORDER BY table_name
     `)
-    return rows.map(r => r.table_name)
+    return rows.map(row => row.table_name)
   }
 
   async getColumns(table: string): Promise<ColumnInfo[]> {
-    const rows = await this.query<{
-      column_name: string
-      data_type: string
-      is_nullable: string
-      column_default: string | null
-    }>(`
+    // One round trip: the primary-key flag is a correlated EXISTS rather than
+    // a second catalog query.
+    const rows = await this.#query<{ column_name: string, is_primary_key: boolean }>(`
       SELECT
-        column_name,
-        data_type,
-        is_nullable,
-        column_default
-      FROM information_schema.columns
-      WHERE table_schema = 'public'
-        AND table_name = $1
-      ORDER BY ordinal_position
+        c.column_name,
+        EXISTS (
+          SELECT 1
+          FROM information_schema.table_constraints tc
+          JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+          WHERE tc.table_schema = 'public'
+            AND tc.table_name = c.table_name
+            AND tc.constraint_type = 'PRIMARY KEY'
+            AND kcu.column_name = c.column_name
+        ) AS is_primary_key
+      FROM information_schema.columns c
+      WHERE c.table_schema = 'public'
+        AND c.table_name = $1
+      ORDER BY c.ordinal_position
     `, [table])
 
-    const pkRows = await this.query<{ column_name: string }>(`
-      SELECT kcu.column_name
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-        AND tc.table_schema = kcu.table_schema
-      WHERE tc.table_schema = 'public'
-        AND tc.table_name = $1
-        AND tc.constraint_type = 'PRIMARY KEY'
-    `, [table])
-
-    const pkColumns = new Set(pkRows.map(r => r.column_name))
-
-    return rows.map(r => ({
-      name: r.column_name,
-      type: r.data_type,
-      nullable: r.is_nullable === 'YES',
-      isPrimaryKey: pkColumns.has(r.column_name),
-      defaultValue: r.column_default,
-    }))
-  }
-
-  async getForeignKeys(table: string): Promise<ForeignKeyInfo[]> {
-    const rows = await this.query<{
-      constraint_name: string
-      column_name: string
-      referenced_table: string
-      referenced_column: string
-    }>(`
-      SELECT
-        tc.constraint_name,
-        kcu.column_name,
-        ccu.table_name AS referenced_table,
-        ccu.column_name AS referenced_column
-      FROM information_schema.table_constraints tc
-      JOIN information_schema.key_column_usage kcu
-        ON tc.constraint_name = kcu.constraint_name
-        AND tc.table_schema = kcu.table_schema
-      JOIN information_schema.constraint_column_usage ccu
-        ON ccu.constraint_name = tc.constraint_name
-        AND ccu.table_schema = tc.table_schema
-      WHERE tc.table_schema = 'public'
-        AND tc.table_name = $1
-        AND tc.constraint_type = 'FOREIGN KEY'
-    `, [table])
-
-    return rows.map(r => ({
-      column: r.column_name,
-      referencedTable: r.referenced_table,
-      referencedColumn: r.referenced_column,
-      constraintName: r.constraint_name,
-    }))
-  }
-
-  async getTableMetadata(table: string): Promise<TableMetadata> {
-    const columns = await this.getColumns(table)
-    const foreignKeys = await this.getForeignKeys(table)
-
-    return {
-      name: table,
-      columns: new Map(columns.map(c => [c.name, c])),
-      primaryKey: columns.filter(c => c.isPrimaryKey).map(c => c.name),
-      foreignKeys,
-    }
+    return rows.map(row => ({ name: row.column_name, isPrimaryKey: row.is_primary_key }))
   }
 
   async fetchRows(table: string, options: {
@@ -186,32 +123,11 @@ export class PostgresConnector implements DbConnector {
   }): Promise<any[]> {
     const parts = [`SELECT * FROM ${table}`]
 
-    if (options.where) {
-      parts.push(`WHERE ${options.where}`)
-    }
+    if (options.where !== undefined) parts.push(`WHERE ${options.where}`)
+    if (options.orderBy !== undefined) parts.push(`ORDER BY ${options.orderBy}`)
+    if (options.limit !== undefined) parts.push(`LIMIT ${options.limit}`)
+    if (options.offset !== undefined) parts.push(`OFFSET ${options.offset}`)
 
-    if (options.orderBy) {
-      parts.push(`ORDER BY ${options.orderBy}`)
-    }
-
-    if (options.limit !== undefined) {
-      parts.push(`LIMIT ${options.limit}`)
-    }
-
-    if (options.offset !== undefined) {
-      parts.push(`OFFSET ${options.offset}`)
-    }
-
-    const sql = parts.join(' ')
-    return this.query(sql)
-  }
-
-  async ping(): Promise<boolean> {
-    try {
-      await this.query('SELECT 1')
-      return true
-    } catch {
-      return false
-    }
+    return this.#query(parts.join(' '))
   }
 }
