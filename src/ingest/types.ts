@@ -116,24 +116,8 @@ export interface IngestDbOutput {
 
 // ============ Internal Types ============
 
+/** One column of a table, as far as mapping validation needs to know. */
 export interface ColumnInfo {
   name: string
-  type: string
-  nullable: boolean
   isPrimaryKey: boolean
-  defaultValue?: unknown
-}
-
-export interface ForeignKeyInfo {
-  column: string
-  referencedTable: string
-  referencedColumn: string
-  constraintName: string
-}
-
-export interface TableMetadata {
-  name: string
-  columns: Map<string, ColumnInfo>
-  primaryKey: string[]
-  foreignKeys: ForeignKeyInfo[]
 }

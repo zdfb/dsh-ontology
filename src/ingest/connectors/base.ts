@@ -3,46 +3,38 @@
  * @module dsh-ontology/ingest/connectors/base
  */
 
-import type {
-  ColumnInfo,
-  ConnectionConfig,
-  ForeignKeyInfo,
-  TableMetadata,
-} from '../types.ts'
+import type { ColumnInfo } from '../types.ts'
 
+/**
+ * What the ingestion engine needs from a database.
+ *
+ * Deliberately narrow: enough to check that a mapping names real tables and
+ * columns, and to read rows. Nothing here exposes foreign-key metadata, because
+ * the mapping states which columns are foreign keys and what they mean — the
+ * schema is not consulted to guess that.
+ */
 export interface DbConnector {
-  /** 建立连接 */
+  /** Open the connection. */
   connect(): Promise<void>
 
-  /** 关闭连接 */
+  /** Close it. Safe to call more than once. */
   close(): Promise<void>
 
-  /** 执行查询 */
-  query<T = any>(sql: string, params?: any[]): Promise<T[]>
-
-  /** 获取所有表名 */
+  /** Every base table in the connected database. */
   getTables(): Promise<string[]>
 
-  /** 获取表的列信息 */
+  /** The columns of one table, in declaration order. */
   getColumns(table: string): Promise<ColumnInfo[]>
 
-  /** 获取表的外键信息 */
-  getForeignKeys(table: string): Promise<ForeignKeyInfo[]>
-
-  /** 获取表的完整元数据 */
-  getTableMetadata(table: string): Promise<TableMetadata>
-
-  /** 查询表数据（支持分页） */
+  /**
+   * Read rows, optionally filtered, ordered, and windowed.
+   * @param table - Table to read.
+   * @param options - The filter and window to apply.
+   */
   fetchRows(table: string, options: {
     where?: string
     limit?: number
     offset?: number
     orderBy?: string
   }): Promise<any[]>
-
-  /** 测试连接是否正常 */
-  ping(): Promise<boolean>
 }
-
-/** 连接器工厂函数类型 */
-export type ConnectorFactory = (config: ConnectionConfig) => DbConnector
