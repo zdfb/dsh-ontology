@@ -1,10 +1,12 @@
 /**
- * Validation logic for mapping configuration
+ * Validation of a mapping against the live schema, and of its classes against
+ * the declared vocabulary. Both run before a single row is read, so a mapping
+ * that cannot work fails with a sentence rather than a partial import.
  * @module dsh-ontology/ingest/validator
  */
 
 import type { DbConnector } from './connectors/base.ts'
-import type { TableMapping, MappingConfig, IngestError } from './types.ts'
+import type { MappingConfig, TableMapping, IngestError } from './types.ts'
 
 export interface ValidationResult {
   valid: boolean
@@ -12,7 +14,16 @@ export interface ValidationResult {
 }
 
 /**
- * Validate mapping configuration against database schema
+ * Check that a mapping names tables and columns that exist.
+ *
+ * Note what this does not do: it does not verify that a column mapped as a
+ * foreign key is declared as one in the schema. The mapping is the statement
+ * of intent, and a column that holds a key to another table is the caller's
+ * claim to make — the ontology's own domain/range check is what catches a
+ * relation asserted between the wrong kinds of thing.
+ * @param connector - An open connection to the source database.
+ * @param config - The mapping to check.
+ * @returns whether it is usable, with every problem found.
  */
 export async function validateMapping(
   connector: DbConnector,
@@ -20,127 +31,90 @@ export async function validateMapping(
 ): Promise<ValidationResult> {
   const errors: IngestError[] = []
 
+  const tables = new Set(await connector.getTables())
+
   for (const mapping of config.tables) {
+    const fail = (message: string) =>
+      errors.push({ table: mapping.table, type: 'validation', message })
+
+    if (!tables.has(mapping.table)) {
+      fail(`table '${mapping.table}' does not exist`)
+      continue
+    }
+
+    let columns: Set<string>
+    let primaryKeys: Set<string>
     try {
-      // Check if table exists
-      const tables = await connector.getTables()
-      if (!tables.includes(mapping.table)) {
-        errors.push({
-          table: mapping.table,
-          type: 'validation',
-          message: `Table '${mapping.table}' does not exist`,
-        })
-        continue
-      }
-
-      // Get table metadata
-      const metadata = await connector.getTableMetadata(mapping.table)
-
-      // Validate ID column
-      if (!metadata.columns.has(mapping.idColumn)) {
-        errors.push({
-          table: mapping.table,
-          type: 'validation',
-          message: `ID column '${mapping.idColumn}' does not exist in table '${mapping.table}'`,
-        })
-      } else {
-        const idCol = metadata.columns.get(mapping.idColumn)!
-        if (!idCol.isPrimaryKey) {
-          errors.push({
-            table: mapping.table,
-            type: 'validation',
-            message: `Column '${mapping.idColumn}' is not a primary key in table '${mapping.table}'`,
-          })
-        }
-      }
-
-      // Validate label column
-      if (mapping.labelColumn && !metadata.columns.has(mapping.labelColumn)) {
-        errors.push({
-          table: mapping.table,
-          type: 'validation',
-          message: `Label column '${mapping.labelColumn}' does not exist in table '${mapping.table}'`,
-        })
-      }
-
-      // Validate comment column
-      if (mapping.commentColumn && !metadata.columns.has(mapping.commentColumn)) {
-        errors.push({
-          table: mapping.table,
-          type: 'validation',
-          message: `Comment column '${mapping.commentColumn}' does not exist in table '${mapping.table}'`,
-        })
-      }
-
-      // Validate attribute columns
-      if (mapping.attributes) {
-        for (const attr of mapping.attributes) {
-          if (!metadata.columns.has(attr.column)) {
-            errors.push({
-              table: mapping.table,
-              type: 'validation',
-              message: `Attribute column '${attr.column}' does not exist in table '${mapping.table}'`,
-            })
-          }
-        }
-      }
-
-      // Validate foreign key columns
-      if (mapping.foreignKeys) {
-        for (const fk of mapping.foreignKeys) {
-          if (!metadata.columns.has(fk.column)) {
-            errors.push({
-              table: mapping.table,
-              type: 'validation',
-              message: `Foreign key column '${fk.column}' does not exist in table '${mapping.table}'`,
-            })
-            continue
-          }
-
-          // Check if target table exists
-          if (!tables.includes(fk.targetTable)) {
-            errors.push({
-              table: mapping.table,
-              type: 'validation',
-              message: `Foreign key target table '${fk.targetTable}' does not exist`,
-            })
-          }
-        }
-      }
+      const info = await connector.getColumns(mapping.table)
+      columns = new Set(info.map(column => column.name))
+      primaryKeys = new Set(info.filter(column => column.isPrimaryKey).map(column => column.name))
     } catch (error) {
-      errors.push({
-        table: mapping.table,
-        type: 'validation',
-        message: `Failed to validate mapping: ${error instanceof Error ? error.message : String(error)}`,
-        detail: error,
-      })
+      fail(`could not read the columns of '${mapping.table}': ${describe(error)}`)
+      continue
+    }
+
+    if (!columns.has(mapping.idColumn)) {
+      fail(`id column '${mapping.idColumn}' does not exist in table '${mapping.table}'`)
+    } else if (!primaryKeys.has(mapping.idColumn)) {
+      fail(`id column '${mapping.idColumn}' is not the primary key of table '${mapping.table}'`)
+    }
+
+    for (const [role, column] of [
+      ['label', mapping.labelColumn],
+      ['comment', mapping.commentColumn],
+    ] as const) {
+      if (column !== undefined && !columns.has(column)) {
+        fail(`${role} column '${column}' does not exist in table '${mapping.table}'`)
+      }
+    }
+
+    for (const attribute of mapping.attributes ?? []) {
+      if (!columns.has(attribute.column)) {
+        fail(`attribute column '${attribute.column}' does not exist in table '${mapping.table}'`)
+      }
+    }
+
+    for (const foreignKey of mapping.foreignKeys ?? []) {
+      if (!columns.has(foreignKey.column)) {
+        fail(`foreign key column '${foreignKey.column}' does not exist in table '${mapping.table}'`)
+      }
+      if (!tables.has(foreignKey.targetTable)) {
+        fail(`foreign key target table '${foreignKey.targetTable}' does not exist`)
+      }
     }
   }
 
-  return {
-    valid: errors.length === 0,
-    errors,
-  }
+  return { valid: errors.length === 0, errors }
 }
 
 /**
- * Validate that entityClass exists in ontology (if store is available)
+ * Check that every class a mapping imports into has been declared.
+ *
+ * The store would reject each row for this anyway, once per row; catching it
+ * here turns thousands of identical errors into one sentence.
+ * @param mappings - The tables about to be imported.
+ * @param declared - Class ids present in the vocabulary.
+ * @returns one error per unknown class.
  */
 export function validateEntityClasses(
-  mappings: TableMapping[],
-  existingClasses: Set<string>,
+  mappings: readonly TableMapping[],
+  declared: ReadonlySet<string>,
 ): IngestError[] {
   const errors: IngestError[] = []
-
   for (const mapping of mappings) {
-    if (!existingClasses.has(mapping.entityClass)) {
+    if (!declared.has(mapping.entityClass)) {
       errors.push({
         table: mapping.table,
         type: 'validation',
-        message: `Entity class '${mapping.entityClass}' is not defined in ontology. Define it first with ontology_define.`,
+        message: `entity class '${mapping.entityClass}' is not defined in the ontology; `
+          + 'declare it with ontology_define first',
       })
     }
   }
-
   return errors
+}
+
+/** Render an unknown thrown value as a message. */
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }

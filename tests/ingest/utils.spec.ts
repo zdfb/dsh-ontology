@@ -8,9 +8,7 @@ import {
   applyTransform,
   resolveEnvVars,
   hasEnvVar,
-  sanitizeId,
   formatDuration,
-  normalizeTableName,
 } from '../../src/ingest/utils.js'
 import type { TableMapping } from '../../src/ingest/types.js'
 
@@ -105,16 +103,6 @@ describe('hasEnvVar', () => {
   })
 })
 
-describe('sanitizeId', () => {
-  it('should remove invalid characters', () => {
-    expect(sanitizeId('hello world!')).toBe('hello_world_')
-  })
-
-  it('should fix leading digit', () => {
-    expect(sanitizeId('123abc')).toBe('_23abc')
-  })
-})
-
 describe('formatDuration', () => {
   it('should format milliseconds', () => {
     expect(formatDuration(500)).toBe('500ms')
@@ -126,12 +114,5 @@ describe('formatDuration', () => {
 
   it('should format minutes', () => {
     expect(formatDuration(65000)).toBe('1.08min')
-  })
-})
-
-describe('normalizeTableName', () => {
-  it('should extract table name from qualified name', () => {
-    expect(normalizeTableName('public.users')).toBe('users')
-    expect(normalizeTableName('users')).toBe('users')
   })
 })

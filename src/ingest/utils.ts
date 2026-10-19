@@ -68,15 +68,6 @@ export function resolveEnvVars(value: string): string {
 }
 
 /**
- * Sanitize identifier to match ontology ID_PATTERN
- */
-export function sanitizeId(id: string): string {
-  return id
-    .replace(/[^A-Za-z0-9_.:-]/g, '_')
-    .replace(/^[^A-Za-z_]/, '_')
-}
-
-/**
  * Check if a value looks like it contains an environment variable reference
  */
 export function hasEnvVar(value: string): boolean {
@@ -90,12 +81,4 @@ export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   if (ms < 60000) return `${(ms / 1000).toFixed(2)}s`
   return `${(ms / 60000).toFixed(2)}min`
-}
-
-/**
- * Extract table name from a potentially qualified name (e.g., "public.users" -> "users")
- */
-export function normalizeTableName(table: string): string {
-  const parts = table.split('.')
-  return parts[parts.length - 1] ?? table
 }
