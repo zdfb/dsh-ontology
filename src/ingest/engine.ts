@@ -17,7 +17,7 @@ import type {
 import { connectDatabase } from './connectors/factory.ts'
 import { validateMapping, validateEntityClasses } from './validator.ts'
 import { transformRows, createPreview } from './transformer.ts'
-import { resolveEnvVars, hasEnvVar, formatDuration } from './utils.ts'
+import { resolveEnvVars, hasEnvVar } from './utils.ts'
 
 /**
  * Execute database ingestion
