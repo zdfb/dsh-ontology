@@ -158,47 +158,266 @@ connected in 3 step(s):
 | `path` | How are these two entities connected? |
 | `dump` | Everything asserted — terms, entities, facts — as data, for export or backup. Re-import is `ontology_define` + `ontology_assert`. |
 
-## Importing from a relational database
+## Complete end-to-end example: From database to queries
 
-An ontology is only useful once there is something in it, and the something is usually already sitting in a database. `ontology_ingest_db` reads a MySQL or PostgreSQL schema and loads it as entities and facts, with **foreign keys becoming the relations**. Declare the vocabulary first — the import validates against it like any other write.
+This section shows a complete workflow: defining vocabulary, importing data from a relational database, and querying the resulting knowledge graph.
 
-The mapping says which table is which class, and what each column means:
+### Step 1: Prepare your database
 
+Suppose you have a business database with users, teams, suppliers, and orders:
+
+```sql
+CREATE TABLE teams (
+  id          SERIAL PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL,
+  region      VARCHAR(50)
+);
+
+CREATE TABLE users (
+  id          SERIAL PRIMARY KEY,
+  full_name   VARCHAR(100) NOT NULL,
+  email       VARCHAR(100),
+  team_id     INTEGER REFERENCES teams(id),
+  manager_id  INTEGER REFERENCES users(id)
+);
+
+CREATE TABLE suppliers (
+  id            SERIAL PRIMARY KEY,
+  company_name  VARCHAR(100) NOT NULL,
+  contact_email VARCHAR(100),
+  country       VARCHAR(10)
+);
+
+CREATE TABLE orders (
+  id          SERIAL PRIMARY KEY,
+  order_no    VARCHAR(50) NOT NULL,
+  amount      NUMERIC(12,2),
+  user_id     INTEGER NOT NULL REFERENCES users(id),
+  supplier_id INTEGER NOT NULL REFERENCES suppliers(id)
+);
+```
+
+### Step 2: Define the vocabulary
+
+Before importing, tell the ontology what classes and relations exist:
+
+```jsonc
+// ontology_define
+{
+  "classes": [
+    { "id": "Team" },
+    { "id": "Person" },
+    { "id": "Supplier" },
+    { "id": "Order" }
+  ],
+  "relations": [
+    // Entity relations (from foreign keys)
+    { "id": "member_of", "domain": ["Person"], "range": ["Team"] },
+    { "id": "reports_to", "domain": ["Person"], "range": ["Person"], 
+      "characteristics": ["transitive"] },
+    { "id": "placed_by", "domain": ["Order"], "range": ["Person"], "inverseOf": "placed" },
+    { "id": "placed", "domain": ["Person"], "range": ["Order"] },
+    { "id": "supplied_by", "domain": ["Order"], "range": ["Supplier"], "inverseOf": "supplies" },
+    { "id": "supplies", "domain": ["Supplier"], "range": ["Order"] },
+    
+    // Literal relations (from regular columns)
+    { "id": "region", "domain": ["Team"], "rangeKind": "literal" },
+    { "id": "has_email", "domain": ["Person"], "rangeKind": "literal" },
+    { "id": "contact_email", "domain": ["Supplier"], "rangeKind": "literal" },
+    { "id": "country_code", "domain": ["Supplier"], "rangeKind": "literal" },
+    { "id": "order_amount", "domain": ["Order"], "rangeKind": "literal" },
+    { "id": "order_status", "domain": ["Order"], "rangeKind": "literal" }
+  ]
+}
+```
+
+Returns: `defined 4 class(es), 12 relation(s)`
+
+### Step 3: Import the database
+
+Now map your tables to the vocabulary and import:
+
+```jsonc
+// ontology_ingest_db
+{
+  "connection": {
+    "type": "postgres",
+    "host": "localhost",
+    "database": "business",
+    "user": "readonly",
+    "password": "${DB_PASSWORD}"   // read from env, never inlined
+  },
+  "mapping": {
+    "tables": [
+      {
+        "table": "teams",
+        "entityClass": "Team",
+        "idColumn": "id",
+        "labelColumn": "name",
+        "attributes": [
+          { "column": "region", "relation": "region" }
+        ]
+      },
+      {
+        "table": "users",
+        "entityClass": "Person",
+        "idColumn": "id",
+        "labelColumn": "full_name",
+        "attributes": [
+          { "column": "email", "relation": "has_email", "transform": "lowercase" }
+        ],
+        "foreignKeys": [
+          { "column": "team_id", "targetTable": "teams", "relation": "member_of" },
+          { "column": "manager_id", "targetTable": "users", "relation": "reports_to", "nullable": true }
+        ]
+      },
+      {
+        "table": "suppliers",
+        "entityClass": "Supplier",
+        "idColumn": "id",
+        "labelColumn": "company_name",
+        "attributes": [
+          { "column": "contact_email", "relation": "contact_email" },
+          { "column": "country", "relation": "country_code", "transform": "uppercase" }
+        ]
+      },
+      {
+        "table": "orders",
+        "entityClass": "Order",
+        "idColumn": "id",
+        "labelColumn": "order_no",
+        "attributes": [
+          { "column": "amount", "relation": "order_amount" },
+          { "column": "status", "relation": "order_status" }
+        ],
+        "foreignKeys": [
+          { "column": "user_id", "targetTable": "users", "relation": "placed_by" },
+          { "column": "supplier_id", "targetTable": "suppliers", "relation": "supplied_by" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Returns: `ingested 14 entit(ies) and 32 fact(s) in 245ms (mode: full)`
+
+What happened:
+- **4 users** → entities `users_1`, `users_2`, `users_3`, `users_4` with class `Person`
+- **2 teams** → entities `teams_1`, `teams_2` with class `Team`
+- **3 suppliers** → entities `suppliers_101`, `suppliers_102`, `suppliers_103` with class `Supplier`
+- **5 orders** → entities `orders_1001` through `orders_1005` with class `Order`
+- **Foreign keys** became relations: `orders_1001 placed_by users_1`, `orders_1001 supplied_by suppliers_101`, etc.
+- **Attributes** became literal facts: `users_1 has_email "zhangsan@example.com"`, `orders_1001 order_amount "5000.00"`
+
+### Step 4: Query the knowledge graph
+
+Now ask questions using natural language concepts:
+
+**Find a person by name:**
+```jsonc
+// ontology_query
+{ "mode": "entities", "classId": "Person", "search": "张三" }
+```
+Returns: `users_1 (Person) "张三"`
+
+**What orders did this person place?**
+```jsonc
+// ontology_query
+{ "mode": "facts", "subject": "users_1", "predicate": "placed", "includeInferred": true }
+```
+Returns:
+```
+users_1 placed orders_1001 (inferred: inverse)
+users_1 placed orders_1002 (inferred: inverse)
+users_1 placed orders_1003 (inferred: inverse)
+```
+
+Note: The database only stores `orders.user_id` (the `placed_by` direction). The reverse `placed` relation is **derived automatically** because we declared `inverseOf`.
+
+**Who supplies these orders?**
+```jsonc
+// ontology_query
+{ "mode": "facts", "subject": "orders_1001", "predicate": "supplied_by" }
+```
+Returns: `orders_1001 supplied_by suppliers_101`
+
+**Find the path from a person to a supplier:**
+```jsonc
+// ontology_query
+{ "mode": "path", "from": "users_1", "to": "suppliers_101", "depth": 4 }
+```
+Returns:
+```
+connected in 2 step(s):
+  users_1 placed orders_1001 (inferred: inverse)
+  orders_1001 supplied_by suppliers_101
+```
+
+**Query the reporting chain (transitive closure):**
+```jsonc
+// ontology_query
+{ "mode": "facts", "subject": "users_4", "predicate": "reports_to", "includeInferred": true }
+```
+Returns:
+```
+users_4 reports_to users_2
+users_4 reports_to users_1 (inferred: transitive)
+```
+
+The database stores only `users_4.manager_id = 2` and `users_2.manager_id = 1`, but the transitive closure gives you the full chain.
+
+### Step 5: Dry-run mode before committing
+
+Before importing production data, preview what would be created:
+
+```jsonc
+// ontology_ingest_db
+{
+  "connection": { /* same as above */ },
+  "mapping": { /* same as above */ },
+  "options": { "mode": "dry-run", "limit": 2 }
+}
+```
+
+Returns a preview with sample entities and facts, without writing anything.
+
+### YAML configuration alternative
+
+You can also save the mapping as a YAML file:
 ```yaml
-# ontology-ingest.yml — the whole example is in examples/
+# ontology-ingest.yml
 connection:
   type: postgres
   host: localhost
   database: business
   user: readonly
-  password: ${DB_PASSWORD}          # read from the environment, never inlined
+  password: ${DB_PASSWORD}
 
 mapping:
   tables:
     - table: users
-      entityClass: Person            # users.id=1 → entity `users_1`
+      entityClass: Person
       idColumn: id
-      labelColumn: full_name         # the label an entity search will match
+      labelColumn: full_name
       attributes:
         - column: email
           relation: has_email
           transform: lowercase
       foreignKeys:
-        - column: team_id            # users.team_id → teams.id
+        - column: team_id
           targetTable: teams
-          relation: member_of        # so: users_1 member_of teams_1
-        - column: manager_id         # a self-reference is fine
+          relation: member_of
+        - column: manager_id
           targetTable: users
           relation: reports_to
-
-    - table: teams
-      entityClass: Team
-      idColumn: id
-      labelColumn: name
-      where: "deleted_at IS NULL"    # soft-deleted rows never reach the graph
+          nullable: true
+    # ... other tables
 ```
 
-Rules of the mapping:
+Then load it: `cat ontology-ingest.yml | yq -o json | ontology_ingest_db`
+
+## Database import mapping rules
 
 | Database | becomes | Notes |
 |---|---|---|
